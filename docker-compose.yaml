@@ -10,7 +10,6 @@ services:
       - gateway
       - url-service-lb
     networks:
-      # - public-network
       - private-network
 
   frontend:
@@ -18,8 +17,6 @@ services:
     ports:
       - "8081:8081"
     networks:
-      # - public-network
-      # - internal-network
       - private-network
     depends_on:
       - gateway
@@ -33,7 +30,6 @@ services:
     depends_on:
       - url-service-lb
     networks:
-      # - internal-network
       - private-network
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
@@ -221,7 +217,3 @@ volumes:
 networks:
   private-network:
     driver: bridge
-  # public-network:
-  #   driver: bridge
-  # internal-network:
-  #   driver: bridge
