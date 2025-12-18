@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -23,8 +25,7 @@ import (
 type urlServer struct {
 	url_service.UnimplementedURLServiceServer
 	mu            sync.RWMutex
-	urls          map[string]string // In-memory cache
-	stats         map[string]int64
+	urls          map[string]string
 	createdAt     map[string]time.Time
 	cacheClient   cache_service.CacheServiceClient
 	storageClient storage_service.StorageServiceClient
@@ -46,7 +47,6 @@ func NewURLServer() (*urlServer, error) {
 
 	return &urlServer{
 		urls:          make(map[string]string),
-		stats:         make(map[string]int64),
 		createdAt:     make(map[string]time.Time),
 		cacheClient:   cache_service.NewCacheServiceClient(cacheConn),
 		storageClient: storage_service.NewStorageServiceClient(storageConn),
@@ -71,7 +71,6 @@ func (s *urlServer) ShortenURL(ctx context.Context, req *url_service.ShortenRequ
 	}
 
 	s.urls[shortCode] = req.OriginalUrl
-	s.stats[shortCode] = 0
 	s.createdAt[shortCode] = time.Now()
 
 	// Persist to storage (async)
@@ -90,18 +89,29 @@ func (s *urlServer) ShortenURL(ctx context.Context, req *url_service.ShortenRequ
 		}
 	}()
 
-	// Cache the URL (async)
+	// Cache the URL with initial count (async)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 
+		// Cache URL value
 		_, err := s.cacheClient.Set(ctx, &cache_service.SetRequest{
-			Key:        shortCode,
+			Key:        "url:" + shortCode,
 			Value:      req.OriginalUrl,
-			TtlSeconds: 360, // 6 mins (demo only)
+			TtlSeconds: 60,
 		})
 		if err != nil {
 			log.Printf("Warning: failed to cache URL: %v", err)
+		}
+
+		// Initialize click count in cache
+		_, err = s.cacheClient.Set(ctx, &cache_service.SetRequest{
+			Key:        "count:" + shortCode,
+			Value:      "0",
+			TtlSeconds: 60,
+		})
+		if err != nil {
+			log.Printf("Warning: failed to initialize click count: %v", err)
 		}
 	}()
 
@@ -117,10 +127,13 @@ func (s *urlServer) GetOriginalURL(ctx context.Context, req *url_service.GetOrig
 	log.Printf("GetOriginalURL request for: %s", req.ShortCode)
 
 	// 1. First try cache (fastest)
-	cacheResp, err := s.cacheClient.Get(ctx, &cache_service.GetRequest{Key: req.ShortCode})
+	cacheResp, err := s.cacheClient.Get(ctx, &cache_service.GetRequest{Key: "url:" + req.ShortCode})
 	if err == nil && cacheResp.Found {
 		log.Printf("Cache hit for: %s", req.ShortCode)
-		s.incrementStats(req.ShortCode) // Update stats
+
+		// Increment count in cache and storage (async)
+		go s.incrementStats(req.ShortCode)
+
 		return &url_service.GetOriginalResponse{
 			OriginalUrl: cacheResp.Value,
 			Found:       true,
@@ -136,7 +149,10 @@ func (s *urlServer) GetOriginalURL(ctx context.Context, req *url_service.GetOrig
 		log.Printf("Memory hit for: %s", req.ShortCode)
 		// Warm the cache for next time
 		go s.warmCache(req.ShortCode, originalURL)
-		s.incrementStats(req.ShortCode)
+
+		// Increment count in cache and storage (async)
+		go s.incrementStats(req.ShortCode)
+
 		return &url_service.GetOriginalResponse{
 			OriginalUrl: originalURL,
 			Found:       true,
@@ -150,12 +166,13 @@ func (s *urlServer) GetOriginalURL(ctx context.Context, req *url_service.GetOrig
 
 		s.mu.Lock()
 		s.urls[req.ShortCode] = storageResp.OriginalUrl
-		s.stats[req.ShortCode] = 0 // Will load actual stats if needed
 		s.createdAt[req.ShortCode] = time.Now()
 		s.mu.Unlock()
 
 		go s.warmCache(req.ShortCode, storageResp.OriginalUrl)
-		s.incrementStats(req.ShortCode)
+
+		// Increment count in cache and storage (async)
+		go s.incrementStats(req.ShortCode)
 
 		return &url_service.GetOriginalResponse{
 			OriginalUrl: storageResp.OriginalUrl,
@@ -172,63 +189,183 @@ func (s *urlServer) GetOriginalURL(ctx context.Context, req *url_service.GetOrig
 func (s *urlServer) GetURLStats(ctx context.Context, req *url_service.StatsRequest) (*url_service.StatsResponse, error) {
 	log.Printf("GetURLStats request for: %s", req.ShortCode)
 
-	s.mu.RLock()
-	clickCount, exists := s.stats[req.ShortCode]
-	createdAt := s.createdAt[req.ShortCode]
-	s.mu.RUnlock()
+	// 1. Try to get click count from cache first
+	countResp, err := s.cacheClient.Get(ctx, &cache_service.GetRequest{Key: "count:" + req.ShortCode})
+	if err == nil && countResp.Found {
+		clickCount, err := strconv.ParseInt(countResp.Value, 10, 64)
+		if err == nil {
+			log.Printf("Cache stats hit for: %s, count: %d", req.ShortCode, clickCount)
 
-	if !exists {
-		storageResp, err := s.storageClient.GetStats(ctx, &storage_service.GetStatsRequest{ShortCode: req.ShortCode})
-		if err == nil && storageResp.Error == "" {
+			// Try to get creation time
+			var createdAt time.Time
+			s.mu.RLock()
+			if ct, exists := s.createdAt[req.ShortCode]; exists {
+				createdAt = ct
+			}
+			s.mu.RUnlock()
+
+			// If creation time not in memory, get from storage
+			if createdAt.IsZero() {
+				storageResp, err := s.storageClient.GetStats(ctx, &storage_service.GetStatsRequest{ShortCode: req.ShortCode})
+				if err == nil && storageResp.Error == "" {
+					// Parse storage creation time
+					if ct, err := time.Parse(time.RFC3339, storageResp.CreatedAt); err == nil {
+						createdAt = ct
+						// Cache the creation time in memory for future requests
+						s.mu.Lock()
+						s.createdAt[req.ShortCode] = createdAt
+						s.mu.Unlock()
+					}
+				}
+			}
+
 			return &url_service.StatsResponse{
 				ShortCode:  req.ShortCode,
-				ClickCount: storageResp.ClickCount,
-				CreatedAt:  storageResp.CreatedAt,
+				ClickCount: clickCount,
+				CreatedAt:  createdAt.Format(time.RFC3339),
 			}, nil
 		}
+	}
+
+	// 2. Fall back to storage if cache miss
+	storageResp, err := s.storageClient.GetStats(ctx, &storage_service.GetStatsRequest{ShortCode: req.ShortCode})
+	if err == nil && storageResp.Error == "" {
+		// Update cache with stats from storage (async)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+
+			// Cache the count
+			countStr := fmt.Sprintf("%d", storageResp.ClickCount)
+			_, err := s.cacheClient.Set(ctx, &cache_service.SetRequest{
+				Key:        "count:" + req.ShortCode,
+				Value:      countStr,
+				TtlSeconds: 60,
+			})
+			if err != nil {
+				log.Printf("Warning: failed to cache stats: %v", err)
+			}
+		}()
+
+		// Cache creation time in memory
+		if createdAt, err := time.Parse(time.RFC3339, storageResp.CreatedAt); err == nil {
+			s.mu.Lock()
+			s.createdAt[req.ShortCode] = createdAt
+			s.mu.Unlock()
+		}
+
 		return &url_service.StatsResponse{
-			Error: "URL not found",
+			ShortCode:  req.ShortCode,
+			ClickCount: storageResp.ClickCount,
+			CreatedAt:  storageResp.CreatedAt,
 		}, nil
 	}
 
 	return &url_service.StatsResponse{
-		ShortCode:  req.ShortCode,
-		ClickCount: clickCount,
-		CreatedAt:  createdAt.Format(time.RFC3339),
+		Error: "URL not found",
 	}, nil
 }
 
 // Helper methods
 func (s *urlServer) incrementStats(shortCode string) {
-	s.mu.Lock()
-	s.stats[shortCode]++
-	s.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
 
-	// Update storage stats async
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
+	// 1. Get current count from cache
+	countResp, err := s.cacheClient.Get(ctx, &cache_service.GetRequest{Key: "count:" + shortCode})
 
-		_, err := s.storageClient.IncrementClick(ctx, &storage_service.IncrementClickRequest{
-			ShortCode: shortCode,
-		})
-		if err != nil {
-			log.Printf("Warning: failed to update storage stats: %v", err)
+	if err == nil && countResp.Found {
+		currentCount, parseErr := strconv.ParseInt(countResp.Value, 10, 64)
+		if parseErr == nil {
+			newCount := currentCount + 1
+			newCountStr := fmt.Sprintf("%d", newCount)
+
+			// Update cache with new count
+			_, err = s.cacheClient.Set(ctx, &cache_service.SetRequest{
+				Key:        "count:" + shortCode,
+				Value:      newCountStr,
+				TtlSeconds: 60,
+			})
+
+			if err == nil {
+				// Async update to storage
+				go func() {
+					storageCtx, storageCancel := context.WithTimeout(context.Background(), 3*time.Second)
+					defer storageCancel()
+
+					_, err := s.storageClient.IncrementClick(storageCtx, &storage_service.IncrementClickRequest{
+						ShortCode: shortCode,
+					})
+					if err != nil {
+						log.Printf("Warning: failed to update storage stats: %v", err)
+					}
+				}()
+
+				log.Printf("Cache count incremented for %s: %d -> %d", shortCode, currentCount, newCount)
+				return
+			}
 		}
-	}()
+	}
+
+	// If cache operation failed, try storage directly
+	log.Printf("Cache operation failed for %s, falling back to storage: %v", shortCode, err)
+
+	storageCtx, storageCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer storageCancel()
+
+	_, err = s.storageClient.IncrementClick(storageCtx, &storage_service.IncrementClickRequest{
+		ShortCode: shortCode,
+	})
+	if err != nil {
+		log.Printf("Warning: failed to increment stats in storage: %v", err)
+	}
 }
 
 func (s *urlServer) warmCache(shortCode, originalURL string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
+	// Cache URL
 	_, err := s.cacheClient.Set(ctx, &cache_service.SetRequest{
-		Key:        shortCode,
+		Key:        "url:" + shortCode,
 		Value:      originalURL,
-		TtlSeconds: 3600,
+		TtlSeconds: 60,
 	})
 	if err != nil {
-		log.Printf("Warning: failed to warm cache: %v", err)
+		log.Printf("Warning: failed to warm URL cache: %v", err)
+		return
+	}
+
+	// Also ensure count exists in cache
+	countResp, err := s.cacheClient.Get(ctx, &cache_service.GetRequest{Key: "count:" + shortCode})
+	if err != nil || !countResp.Found {
+		// try to get from storage
+		storageCtx, storageCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer storageCancel()
+
+		statsResp, err := s.storageClient.GetStats(storageCtx, &storage_service.GetStatsRequest{ShortCode: shortCode})
+		if err == nil && statsResp.Error == "" {
+			// Cache the count
+			countStr := fmt.Sprintf("%d", statsResp.ClickCount)
+			_, err := s.cacheClient.Set(ctx, &cache_service.SetRequest{
+				Key:        "count:" + shortCode,
+				Value:      countStr,
+				TtlSeconds: 60,
+			})
+			if err != nil {
+				log.Printf("Warning: failed to warm count cache: %v", err)
+			}
+		} else {
+			// Initialize with 0 if not found in storage
+			_, err := s.cacheClient.Set(ctx, &cache_service.SetRequest{
+				Key:        "count:" + shortCode,
+				Value:      "0",
+				TtlSeconds: 60,
+			})
+			if err != nil {
+				log.Printf("Warning: failed to initialize count cache: %v", err)
+			}
+		}
 	}
 }
 
