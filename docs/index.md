@@ -62,7 +62,7 @@ Read more in the [Implementation](implementation.md) page.
 
 ## ⭐ GitHub Repository
 
-👉 [View the source code on GitHub](../README.md)
+👉 View the source code on [GitHub](https://www.github.com/syedalijabir/url-shortener-system-design/README.md)
 
 ---
 
