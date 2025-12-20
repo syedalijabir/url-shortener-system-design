@@ -142,7 +142,7 @@ Frontend UI: [http://localhost](http://localhost)
 Gateway/API: [http://localhost:8080](http://localhost:8080)
 (check docker-compose.yaml for the mappings)
 
-<img src="docs/diagrams/frontend.png" width="400">
+<img src="docs/diagrams/frontend.png" width="1000">
 
 ### Configuration
 
