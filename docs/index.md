@@ -32,7 +32,7 @@ It follows modern system design best practices and includes diagrams, explanatio
 
 ## 📐 Architecture Overview
 
-![URL shortener high-level architecture](./diagrams/high-level.png)
+![URL shortener high-level architecture](./diagrams/top-level.png)
 
 The system is divided into three main layers:
 

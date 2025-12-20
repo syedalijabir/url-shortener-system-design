@@ -24,3 +24,7 @@ Multiple STRG-SVC containers sit behind a load balancer and talk to Postgres.
 Multiple CACHE-SVC containers sit behind a load balancer and talk to Redis.
 
 All services communicate via an internal Docker network to ensure isolation and security. For the purpose of this demo we only use a single network.
+
+UI is available at `http://locahost`
+
+![UI View](./diagrams/frontend.png)
