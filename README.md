@@ -42,7 +42,9 @@ At a high level, the system lets you:
 
 The project is split into multiple micro-services. A top level architecture diagram is shown below:
 
+<div style="text-align: center;">
 <img src="docs/diagrams/top-level.png" width="400">
+</div>
 
 This architecture separates **public-facing access** from **internal service logic** to keep the system secure, scalable, and maintainable. Users reach the system through a **reverse proxy** in the public network, which handles HTTPS, routing, and protects the private network. Behind it, all application components live in a **private network**, where a **frontend service** communicates with an internal **API gateway** that controls and routes API requests. The gateway sends requests to the core **URL service**, which performs the business logic and relies on specialized internal components: a **storage service** for database access and a **cache service** for fast lookup. Postgres and Redis are never exposed directly; they are accessed only through these services.
 
@@ -50,7 +52,9 @@ This architecture separates **public-facing access** from **internal service log
 
 The implemtation of architecture is done using docker containers in the following fashion:
 
+<div style="text-align: center;">
 <img src="docs/diagrams/docker-architecture.png" width="400">
+</div>
 
 In this implementation we took each logical block from the earlier design and turned it into one or more Docker containers wired together. At the very edge, the **Reverse proxy** is an Nginx container that accepts all external HTTP(S) traffic. It forwards requests to a **Gateway** container, which is our URL API gateway service running in Docker and offloading incoming HTTP(S) to internal gRPC calls. Behind that, we added an internal **URL-SVC load balancer** (another Nginx container) that distributes requests across two identical **URL-SVC** app containers (`URL-SVC-1` and `URL-SVC-2`) for horizontal scaling. The URL service then talks to two other tiers, each with the same pattern: a **STRG-SVC load balancer** in front of two **storage service** containers (`STRG-SVC-1`, `STRG-SVC-2`) that handle all communication with a single **Postgres** database container; and a **CACHE-SVC load balancer** in front of two **cache service** containers (`CACHE-SVC-1`, `CACHE-SVC-2`) that talk to a **Redis** container. So: every logical service is one or more Docker containers, and any service that needs to scale out has its own dedicated Nginx load-balancer container in front of multiple replicas.
 
@@ -142,7 +146,9 @@ Frontend UI: [http://localhost](http://localhost)
 Gateway/API: [http://localhost:8080](http://localhost:8080)
 (check docker-compose.yaml for the mappings)
 
+<div style="text-align: center;">
 <img src="docs/diagrams/frontend.png" width="1000">
+</div>
 
 ### Configuration
 
